@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Horror Game — Single File</title>
+  <style>
+    /* Basic page and canvas setup */
+    html,body{height:100%;margin:0;background:#000;color:#eee;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{display:flex;flex-direction:column;height:100%}
+    header{padding:12px;background:linear-gradient(90deg,rgba(0,0,0,.6),rgba(0,0,0,.2));display:flex;align-items:center;gap:12px}
+    header h1{font-size:18px;margin:0}
+    .controls{margin-left:auto;font-size:13px;opacity:.9}
+    canvas#game{flex:1;display:block; width:100%; height:100%;background:#111}
+
+    /* HUD */
+    .hud{position:fixed;left:12px;bottom:12px;background:rgba(0,0,0,0.5);padding:8px;border-radius:8px;font-size:13px}
+    .message{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);color:#fff;text-align:center;font-size:28px;display:none}
+
+    /* Jump-scare overlay */
+    #jumpscare{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#000;z-index:50;opacity:0;pointer-events:none;transition:opacity .2s}
+    #jumpscare img{max-width:80vw;max-height:80vh;filter:contrast(140%) saturate(120%)}
+
+    /* Small footer / instructions for players */
+    footer{padding:8px;font-size:12px;text-align:center;background:linear-gradient(0deg,rgba(0,0,0,.3),transparent)}
+
+    @media (max-width:700px){header h1{font-size:14px}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>Horror Game (Single-file)</h1>
+      <div class="controls">WASD — move · Mouse — aim flashlight · Click — toggle flashlight</div>
+    </header>
+
+    <canvas id="game"></canvas>
+
+    <div class="hud" id="hud">Health: <span id="hp">100</span> · Keys: <span id="keys">0</span></div>
+    <div class="message" id="message"></div>
+    <div id="jumpscare" aria-hidden="true">
+      <!-- simple SVG face used for a jumpscare (no external assets) -->
+      <svg id="scare-face" viewBox="0 0 600 600" xmlns="http://www.w3.org/2000/svg" style="width:60vmin;height:60vmin">
+        <rect width="100%" height="100%" fill="#000"/>
+        <g transform="translate(300,300)">
+          <ellipse rx="180" ry="220" fill="#fff"/>
+          <circle cx="-70" cy="-40" r="28" fill="#000"/>
+          <circle cx="70" cy="-40" r="28" fill="#000"/>
+          <path d="M -110 80 C -70 180, 70 180, 110 80 C 70 220, -70 220, -110 80" fill="#000"/>
+        </g>
+      </svg>
+    </div>
+
+    <footer>Open this file in your browser. This is a demo — modify map, AI, lighting and sounds as you like.</footer>
+  </div>
+
+<script>
+/*
+  Single-file horror game
+  - Canvas-based top-down demo
+  - Flashlight / darkness effect using composite operation
+  - Basic enemy that chases player
+  - Simple synthesized ambient sound and jump-scare noise (WebAudio)
+  - No external assets required (SVG jumpscare included)
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let DPR = Math.max(1, window.devicePixelRatio || 1);
+function resize() {
+  DPR = Math.max(1, window.devicePixelRatio || 1);
+  canvas.width = Math.floor(canvas.clientWidth * DPR);
+  canvas.height = Math.floor(canvas.clientHeight * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// Game world size (in world coords)
+const WORLD_W = 1600;
+const WORLD_H = 900;
+
+// Player
+const player = {x: WORLD_W/2, y: WORLD_H/2, r: 12, speed: 160, hp: 100};
+let keysDown = {};
+window.addEventListener('keydown', e=>{keysDown[e.key.toLowerCase()] = true});
+window.addEventListener('keyup', e=>{keysDown[e.key.toLowerCase()] = false});
+
+// Mouse for flashlight
+let mouse = {x: canvas.width/2, y: canvas.height/2};
+canvas.addEventListener('mousemove', e=>{
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left);
+  mouse.y = (e.clientY - rect.top);
+});
+
+let flashlightOn = true;
+canvas.addEventListener('click', ()=> flashlightOn = !flashlightOn);
+
+// Simple map: walls are rectangles
+const walls = [
+  {x:200,y:120,w:1200,h:20},
+  {x:200,y:760,w:1200,h:20},
+  {x:200,y:120,w:20,h:660},
+  {x:1380,y:120,w:20,h:660},
+  // interior obstacles
+  {x:500,y:300,w:40,h:200},
+  {x:800,y:200,w:40,h:200},
+  {x:1100,y:350,w:200,h:40}
+];
+
+// Items (keys) player must collect to escape
+const items = [
+  {x:300,y:200, picked:false},
+  {x:1400,y:700, picked:false}
+];
+
+// Enemy
+const enemy = {x:300,y:700,r:18, speed:80, alive:true, alert: false};
+
+// Camera follows player
+function worldToScreen(wx,wy,camera) {
+  return {x: wx - camera.x, y: wy - camera.y};
+}
+
+// Camera center coordinates
+const camera = {x: player.x - canvas.clientWidth/2, y: player.y - canvas.clientHeight/2};
+
+// Time
+let last = performance.now();
+
+// HUD elements
+const hpEl = document.getElementById('hp');
+const keysEl = document.getElementById('keys');
+const messageEl = document.getElementById('message');
+
+// Jumpscare overlay
+const jumpscare = document.getElementById('jumpscare');
+
+// WebAudio setup for ambient and jump-scare
+const AudioCtx = window.AudioContext || window.webkitAudioContext;
+const audioCtx = AudioCtx ? new AudioCtx() : null;
+let ambientGain;
+if (audioCtx) {
+  const osc = audioCtx.createOscillator();
+  osc.type = 'sine';
+  osc.frequency.value = 60; // low ambient
+  ambientGain = audioCtx.createGain();
+  ambientGain.gain.value = 0.02;
+  osc.connect(ambientGain).connect(audioCtx.destination);
+  osc.start();
+}
+
+function playJumpScare() {
+  if (!audioCtx) return;
+  const now = audioCtx.currentTime;
+  // create a burst of noise-like sound
+  const bufferSize = audioCtx.sampleRate * 0.5;
+  const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+  const data = buffer.getChannelData(0);
+  // fill with random noise then shape it
+  for (let i=0;i<bufferSize;i++) data[i] = (Math.random()*2-1) * Math.exp(-i/(bufferSize*0.1));
+  const src = audioCtx.createBufferSource();
+  src.buffer = buffer;
+  const g = audioCtx.createGain();
+  g.gain.value = 0.0001;
+  src.connect(g).connect(audioCtx.destination);
+  src.start(now);
+  g.gain.linearRampToValueAtTime(0.8, now + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+}
+
+// Simple collision detection
+function rectsIntersect(a,b){return !(a.x+b.w < a.x || a.x > b.x + b.w)}
+function circleRectCollide(cx,cy,r,rx,ry,rw,rh){
+  // find closest point
+  const closestX = Math.max(rx, Math.min(cx, rx+rw));
+  const closestY = Math.max(ry, Math.min(cy, ry+rh));
+  const dx = cx - closestX; const dy = cy - closestY;
+  return (dx*dx + dy*dy) <= (r*r);
+}
+
+// Ensure player doesn't go through walls (simple push back)
+function handleCollisions(px,py,r){
+  let nx = px, ny = py;
+  for (const w of walls){
+    if (circleRectCollide(nx,ny,r,w.x,w.y,w.w,w.h)){
+      // push out along shortest axis
+      const left = Math.abs((w.x) - (nx + r));
+      const right = Math.abs((w.x + w.w) - (nx - r));
+      const top = Math.abs((w.y) - (ny + r));
+      const bottom = Math.abs((w.y + w.h) - (ny - r));
+      const min = Math.min(left,right,top,bottom);
+      if (min === left) nx = w.x - r;
+      else if (min === right) nx = w.x + w.w + r;
+      else if (min === top) ny = w.y - r;
+      else ny = w.y + w.h + r;
+    }
+  }
+  // clamp to world
+  nx = Math.max(r, Math.min(WORLD_W - r, nx));
+  ny = Math.max(r, Math.min(WORLD_H - r, ny));
+  return {x:nx,y:ny};
+}
+
+// Game loop
+function loop(now){
+  const dt = Math.min(0.05, (now - last)/1000);
+  last = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function update(dt){
+  // player input
+  let vx = 0, vy = 0;
+  if (keysDown['w'] || keysDown['arrowup']) vy -= 1;
+  if (keysDown['s'] || keysDown['arrowdown']) vy += 1;
+  if (keysDown['a'] || keysDown['arrowleft']) vx -= 1;
+  if (keysDown['d'] || keysDown['arrowright']) vx += 1;
+  // normalize
+  if (vx !== 0 || vy !== 0){
+    const len = Math.hypot(vx,vy); vx /= len; vy /= len;
+    player.x += vx * player.speed * dt;
+    player.y += vy * player.speed * dt;
+    const fixed = handleCollisions(player.x, player.y, player.r);
+    player.x = fixed.x; player.y = fixed.y;
+  }
+
+  // camera follows
+  camera.x = player.x - canvas.clientWidth/2;
+  camera.y = player.y - canvas.clientHeight/2;
+  camera.x = Math.max(0, Math.min(WORLD_W - canvas.clientWidth, camera.x));
+  camera.y = Math.max(0, Math.min(WORLD_H - canvas.clientHeight, camera.y));
+
+  // enemy simple chasing AI with line-of-sight check
+  const dx = player.x - enemy.x;
+  const dy = player.y - enemy.y;
+  const dist = Math.hypot(dx,dy);
+  if (dist < 350) enemy.alert = true; // becomes alert if close enough
+  if (enemy.alert && enemy.alive){
+    // move toward player
+    const ex = (dx/dist) || 0;
+    const ey = (dy/dist) || 0;
+    enemy.x += ex * enemy.speed * dt * (dist<160?1.4:1);
+    enemy.y += ey * enemy.speed * dt * (dist<160?1.4:1);
+  }
+
+  // enemy collision with walls (simple clamp)
+  const efix = handleCollisions(enemy.x, enemy.y, enemy.r);
+  enemy.x = efix.x; enemy.y = efix.y;
+
+  // if enemy close enough -> damage
+  if (dist < player.r + enemy.r + 8){
+    player.hp -= 30 * dt; // damage per second
+    if (player.hp <= 0){
+      player.hp = 0; gameOver(false);
+    }
+    // trigger jump-scare occasionally
+    if (Math.random() < 0.02) triggerJumpScare();
+  }
+
+  // pick up items
+  for (const it of items){
+    if (!it.picked && Math.hypot(player.x - it.x, player.y - it.y) < 28){
+      it.picked = true; document.getElementById('keys').textContent = items.filter(i=>i.picked).length;
+      showMessage('You found a key...');
+    }
+  }
+
+  // Win condition: all keys and reach exit
+  const keysFound = items.filter(i=>i.picked).length;
+  if (keysFound === items.length && player.x > WORLD_W - 80 && player.y > WORLD_H - 80){
+    gameOver(true);
+  }
+
+  hpEl.textContent = Math.max(0, Math.floor(player.hp));
+}
+
+let ended = false;
+function gameOver(win){
+  if (ended) return; ended = true;
+  if (win){
+    showMessage('You escaped — for now...');
+  } else {
+    showMessage('You died. The house keeps you.');
+    triggerJumpScare();
+  }
+}
+
+let msgTimer = null;
+function showMessage(txt, t=3000){
+  messageEl.textContent = txt; messageEl.style.display = 'block';
+  if (msgTimer) clearTimeout(msgTimer);
+  msgTimer = setTimeout(()=>{messageEl.style.display = 'none';}, t);
+}
+
+function triggerJumpScare(){
+  jumpscare.style.opacity = 1; jumpscare.style.pointerEvents = 'auto';
+  if (audioCtx) { try{audioCtx.resume();}catch(e){} playJumpScare(); }
+  setTimeout(()=>{ jumpscare.style.opacity = 0; jumpscare.style.pointerEvents = 'none'; }, 700);
+}
+
+// Draw world
+function render(){
+  // clear
+  ctx.clearRect(0,0,canvas.clientWidth,canvas.clientHeight);
+
+  // draw floor (a subtle noisy gradient)
+  const camX = camera.x, camY = camera.y;
+  ctx.save();
+  ctx.fillStyle = '#0b0b0b';
+  ctx.fillRect(0,0,canvas.clientWidth,canvas.clientHeight);
+
+  // translate to camera
+  ctx.translate(-camX, -camY);
+
+  // draw map boundary background
+  ctx.fillStyle = '#161616';
+  ctx.fillRect(0,0,WORLD_W,WORLD_H);
+
+  // add some dirty texture with simple rects
+  for (let i=0;i<50;i++){
+    ctx.fillStyle = `rgba(20,20,20,${Math.random()*0.08})`;
+    ctx.fillRect((i*37)%WORLD_W, (i*81)%WORLD_H, 120, 40);
+  }
+
+  // walls
+  ctx.fillStyle = '#222';
+  for (const w of walls){ ctx.fillRect(w.x,w.y,w.w,w.h); }
+
+  // items
+  for (const it of items){
+    if (!it.picked){
+      ctx.beginPath(); ctx.arc(it.x, it.y, 10, 0, Math.PI*2); ctx.fillStyle = '#cdb400'; ctx.fill();
+      // key sparkle
+      ctx.strokeStyle = 'rgba(255,230,120,0.6)'; ctx.stroke();
+    }
+  }
+
+  // player
+  ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI*2);
+  ctx.fillStyle = '#8ecae6'; ctx.fill();
+  ctx.lineWidth = 2; ctx.strokeStyle = '#2b7a9b'; ctx.stroke();
+
+  // enemy
+  if (enemy.alive){
+    ctx.save();
+    ctx.beginPath(); ctx.arc(enemy.x, enemy.y, enemy.r, 0, Math.PI*2);
+    ctx.fillStyle = enemy.alert ? '#ff6b6b' : '#8b2e2e'; ctx.fill();
+    ctx.strokeStyle = '#000'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.restore();
+  }
+
+  // exit area (bottom-right corner)
+  ctx.fillStyle = 'rgba(80,120,60,0.05)'; ctx.fillRect(WORLD_W-80, WORLD_H-80, 80, 80);
+  ctx.fillStyle = '#39531a'; ctx.font = '16px sans-serif'; ctx.fillText('EXIT', WORLD_W-60, WORLD_H-50);
+
+  // restore to screen coords (undo translate)
+  ctx.translate(camX, camY);
+
+  // darkness layer
+  // fill full screen with near-black then cut out a radial gradient around mouse (flashlight)
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.95)';
+  ctx.fillRect(0,0,canvas.clientWidth,canvas.clientHeight);
+
+  if (flashlightOn){
+    // compute flashlight world position of mouse
+    const fx = camera.x + mouse.x;
+    const fy = camera.y + mouse.y;
+    const radius = Math.max(140, 260 - (Math.hypot(player.x - fx, player.y - fy)/2));
+
+    const grad = ctx.createRadialGradient(mouse.x, mouse.y, radius*0.08, mouse.x, mouse.y, radius);
+    grad.addColorStop(0, 'rgba(255,255,230,0.98)');
+    grad.addColorStop(0.2, 'rgba(255,255,210,0.7)');
+    grad.addColorStop(0.45, 'rgba(60,60,60,0.15)');
+    grad.addColorStop(1, 'rgba(0,0,0,0)');
+
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(mouse.x, mouse.y, radius, 0, Math.PI*2); ctx.fill();
+    ctx.globalCompositeOperation = 'source-over';
+  }
+
+  // vignette
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.fillRect(0,0,canvas.clientWidth,canvas.clientHeight);
+  ctx.restore();
+
+  ctx.restore();
+}
+
+// resume audio on user gesture
+window.addEventListener('click', ()=>{ if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume(); });
+
+// start message
+showMessage('Find the keys and reach the EXIT. Don\'t let it find you.');
+
+</script>
+</body>
+</html>
+ss
